@@ -43,14 +43,16 @@ struct Transaction {
     id: String,
     vins: Vec<VIn>,
     vouts: Vec<VOut>,
+    isCoinbase: bool,
 }
 
 impl Transaction {
-    fn new(id: String, vins: Vec<VIn>, vouts: Vec<VOut>) -> Transaction {
+    fn new(id: String, vins: Vec<VIn>, vouts: Vec<VOut>, isCoinbase: bool) -> Transaction {
         Transaction {
             id,
             vins,
             vouts,
+            isCoinbase
         }
     }
 }
@@ -85,7 +87,7 @@ impl TransactionManager {
         let vout = VOut {
             id: 0,
             username: user.username.clone(),
-            hashed_pub_key: "".to_string(),
+            hashed_pub_key: user.pub_key.clone(),
             value,
         };
 
@@ -96,6 +98,7 @@ impl TransactionManager {
             "".to_string(),
             vins,
             vouts,
+            true,
         );
 
         self.transactions.push(tx);
