@@ -1,0 +1,30 @@
+0:
+  in:
+    id: 0
+    dir: none
+    firma: none
+    public_key: none
+
+  out:
+    id: 0
+    user: jose
+    public_key: 123456
+    value: 4
+
+1:
+  in:
+    id: 0
+    dir: 0.0
+    firma: 123456-f4
+    public_key: 123456
+  
+  out:
+    id: 0
+    user: pedro
+    public_key: 654321
+    value: 3
+    -
+    id: 1
+    user: jose
+    public_key: 123456
+    value: 1
