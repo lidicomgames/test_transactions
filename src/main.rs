@@ -1,4 +1,10 @@
-use std::collections::HashMap;
+use futures::stream::TryStreamExt;
+use sha2::{Digest, Sha256};
+use std::{collections::HashMap, time::SystemTime};
+
+use mongodb::{bson::doc, options::ClientOptions, options::FindOptions, Client};
+use serde::{Deserialize, Serialize};
+
 // Bank Transactions as blockchain TX
 
 //
@@ -26,7 +32,7 @@ impl User {
 // System of transactions with VIn and VOut
 //
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct VIn {
     id: u32,
     txdir: String,
@@ -35,30 +41,64 @@ struct VIn {
     pub_key: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct VOut {
     id: u32,
-    txdir: String,
     username: String,
     hashed_pub_key: String,
     value: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Transaction {
-    id: String,
+    hash: String,
+    timestamp: u64,
     vins: Vec<VIn>,
     vouts: Vec<VOut>,
+    users: Vec<String>,
     is_coinbase: bool,
 }
 
 impl Transaction {
-    fn new(id: String, vins: Vec<VIn>, vouts: Vec<VOut>, is_coinbase: bool) -> Transaction {
+    fn new(vins: Vec<VIn>, vouts: Vec<VOut>, users: Vec<String>, is_coinbase: bool) -> Transaction {
+        let mut hasher = Sha256::new();
+
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        hasher.update(timestamp.to_string().as_bytes());
+
+        vins.iter().for_each(|vin| {
+            hasher.update(format!("{}", vouts.len()).as_bytes());
+            hasher.update(format!("{}", vin.id).as_bytes());
+            hasher.update(format!("{}", vin.txdir).as_bytes());
+            hasher.update(format!("{}", vin.vout).as_bytes());
+            hasher.update(format!("{}", vin.firm).as_bytes());
+            hasher.update(format!("{}", vin.pub_key).as_bytes());
+        });
+
+        vouts.iter().for_each(|vout| {
+            hasher.update(format!("{}", vouts.len()).as_bytes());
+            hasher.update(format!("{}", vout.id).as_bytes());
+            hasher.update(format!("{}", vout.hashed_pub_key).as_bytes());
+            hasher.update(format!("{}", vout.username).as_bytes());
+            hasher.update(format!("{}", vout.value).as_bytes());
+        });
+
+        users.iter().for_each(|user| {
+            hasher.update(format!("{}", users.len()).as_bytes());
+            hasher.update(format!("{}", user).as_bytes());
+        });
+
         Transaction {
-            id,
+            hash: format!("{:x}", hasher.finalize()),
+            timestamp,
             vins,
             vouts,
             is_coinbase,
+            users,
         }
     }
 }
@@ -69,22 +109,28 @@ impl Transaction {
 
 #[derive(Debug)]
 struct TransactionManager {
-    transactions: Vec<Transaction>,
-    counter: u32,
+    db: mongodb::Database,
 }
 
 impl TransactionManager {
-    fn new() -> TransactionManager {
-        TransactionManager {
-            transactions: Vec::new(),
-            counter: 0,
-        }
+    async fn new() -> Result<TransactionManager, mongodb::error::Error> {
+        let opts = ClientOptions::parse("mongodb://localhost:27017/").await?;
+        let client = Client::with_options(opts)?;
+
+        Ok(TransactionManager {
+            db: client.database("ressy"),
+        })
     }
 
-    fn create_coinbase(&mut self, user: &User, value: u32) {
+    async fn create_coinbase(
+        &mut self,
+        user: &User,
+        value: u32,
+    ) -> Result<(), mongodb::error::Error> {
+        let tx_coll = self.db.collection::<Transaction>("transactions");
+
         let mut vins = Vec::new();
         let mut vouts = Vec::new();
-        let txdir = self.counter;
 
         let vin = VIn {
             id: 0,
@@ -96,7 +142,6 @@ impl TransactionManager {
 
         let vout = VOut {
             id: 0,
-            txdir: txdir.to_string(),
             username: user.username.clone(),
             hashed_pub_key: user.pub_key.clone(),
             value,
@@ -105,22 +150,32 @@ impl TransactionManager {
         vins.push(vin);
         vouts.push(vout);
 
-        let tx = Transaction::new(txdir.to_string(), vins, vouts, true);
-        self.counter += 1;
+        let tx = Transaction::new(vins, vouts, vec![user.pub_key.to_string()], true);
+        tx_coll.insert_one(tx, None).await?;
 
-        self.transactions.push(tx);
+        Ok(())
     }
 
-    fn get_unspent(&self, user: &User) -> Vec<&VOut> {
-        let mut unspent_tx: Vec<&VOut> = Vec::new();
+    async fn get_unspent<'a>(
+        &self,
+        user: &User,
+    ) -> Result<Vec<(String, VOut)>, mongodb::error::Error> {
+        let tx_coll = self.db.collection::<Transaction>("transactions");
+
+        let filter = doc! {"users": user.pub_key.clone()};
+        let options = FindOptions::builder()
+            .sort(doc! {"$natural": -1})
+            .build();
+
+        let mut transactions = tx_coll.find(filter, options).await?;
+
+        let mut unspent_tx: Vec<(String, VOut)> = Vec::new();
         let mut spent_txs: HashMap<String, Vec<u32>> = HashMap::new();
 
-        for tx_index in (0..self.transactions.len()).rev() {
-            let tx = &self.transactions[tx_index];
-
-            'outs: for out in &tx.vouts {
-                if spent_txs.contains_key(&tx.id) {
-                    let spentout_by_tx = spent_txs.get(&tx.id).unwrap();
+        while let Some(transaction) = transactions.try_next().await? {
+            'outs: for out in &transaction.vouts {
+                if spent_txs.contains_key(&transaction.hash) {
+                    let spentout_by_tx = spent_txs.get(&transaction.hash).unwrap();
                     for spent_out in spentout_by_tx {
                         if spent_out == &out.id {
                             continue 'outs;
@@ -130,12 +185,12 @@ impl TransactionManager {
 
                 // Verificar que esa salida pertenece al usuario
                 if out.hashed_pub_key == user.pub_key {
-                    unspent_tx.push(out.clone());
+                    unspent_tx.push((transaction.hash.clone(), out.clone()));
                 }
             }
 
-            if tx.is_coinbase == false {
-                for vin in &tx.vins {
+            if transaction.is_coinbase == false {
+                for vin in &transaction.vins {
                     if vin.pub_key == user.pub_key {
                         let spentout_by_tx = spent_txs.entry(vin.txdir.clone()).or_default();
                         spentout_by_tx.push(vin.vout);
@@ -144,46 +199,47 @@ impl TransactionManager {
             }
         }
 
-        unspent_tx.clone()
+        Ok(unspent_tx)
     }
 
-    fn get_balance(&self, user: &User) -> u32 {
-        let unspents = self.get_unspent(user);
+    async fn get_balance(&self, user: &User) -> Result<u32, mongodb::error::Error> {
+        let transaction_unspent = self.get_unspent(user).await?;
 
-        self.get_balance_in_vout(unspents)
-    }
-
-    fn get_balance_in_vout(&self, vouts: Vec<&VOut>) -> u32 {
         let mut balance = 0;
-        for out in vouts {
-            balance += out.value;
+
+        for (_, vout) in transaction_unspent {
+            if vout.hashed_pub_key == user.pub_key {
+                balance += vout.value;
+            }
         }
 
-        balance
+        Ok(balance)
     }
 
-    fn send(&mut self, from: &User, to: &User, value: u32) {
-        let unspent = self.get_unspent(from);
+    async fn send(&mut self, from: &User, to: &User, value: u32) {
+        let tx_coll = self.db.collection::<Transaction>("transactions");
+
+        let transactions_unspent = self.get_unspent(from).await.unwrap();
         let mut vins = Vec::new();
         let mut total = 0;
         let mut vouts = Vec::new();
-        let new_txdir = self.counter;
 
-        for i in 0..unspent.len() {
-            let out = unspent[i];
+        'txs: for i in 0..transactions_unspent.len() {
+            let (hash, vout) = &transactions_unspent[i];
+            if vout.hashed_pub_key == from.pub_key {
+                total += vout.value;
 
-            total += out.value;
+                vins.push(VIn {
+                    id: i as u32,
+                    txdir: hash.clone(),
+                    vout: vout.id,
+                    firm: "".to_string(),
+                    pub_key: from.pub_key.clone(),
+                });
 
-            vins.push(VIn {
-                id: i as u32,
-                txdir: out.txdir.clone(),
-                vout: out.id,
-                firm: "".to_string(),
-                pub_key: from.pub_key.clone(),
-            });
-
-            if total >= value {
-                break;
+                if total >= value {
+                    break 'txs;
+                }
             }
         }
 
@@ -193,7 +249,6 @@ impl TransactionManager {
 
         vouts.push(VOut {
             id: 0,
-            txdir: new_txdir.to_string(),
             username: to.username.clone(),
             hashed_pub_key: to.pub_key.clone(),
             value,
@@ -202,46 +257,29 @@ impl TransactionManager {
         if total > value {
             vouts.push(VOut {
                 id: 1,
-                txdir: new_txdir.to_string(),
                 username: from.username.clone(),
                 hashed_pub_key: from.pub_key.clone(),
                 value: (total as i64 - value as i64) as u32,
             })
         }
 
-        let new_transaction = Transaction::new(new_txdir.to_string(), vins, vouts, false);
-        self.counter += 1;
+        let new_transaction = Transaction::new(
+            vins,
+            vouts,
+            vec![from.pub_key.clone(), to.pub_key.clone()],
+            false,
+        );
+        tx_coll.insert_one(new_transaction, None).await.unwrap();
 
-        self.transactions.push(new_transaction);
-        println!("{} envio {} dolares a {}", from.username, value, to.username);
-    }
-
-    fn print_transactions(&self) {
-        for tx in &self.transactions {
-            println!("Transaction {}", tx.id);
-            println!(" Ins:");
-            for ins in &tx.vins {
-                println!("  id: {}", ins.id);
-                println!("  txdir: {}", ins.txdir);
-                println!("  firm: {}", ins.firm);
-                println!("  pub_key: {}", ins.pub_key);
-                println!("  vout: {}", ins.vout);
-                println!("-");
-            }
-            println!(" Outs:");
-            for outs in &tx.vouts {
-                println!("  id: {}", outs.id);
-                println!("  txdir: {}", outs.txdir);
-                println!("  username: {}", outs.username);
-                println!("  pub_key: {}", outs.hashed_pub_key);
-                println!("  value: {}", outs.value);
-                println!("-");
-            }
-        }
+        println!(
+            "{} envio {} dolares a {}",
+            from.username, value, to.username
+        );
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), mongodb::error::Error> {
     let user_juan = User::new(
         "juan".to_string(),
         "juan123".to_string(),
@@ -253,33 +291,35 @@ fn main() {
         "p123".to_string(),
     );
 
-    let user_yeff= User::new(
+    let user_yeff = User::new(
         "Yeferson".to_string(),
         "yeff123".to_string(),
         "y123".to_string(),
     );
 
-    let mut transaction_manager = TransactionManager::new();
-    transaction_manager.create_coinbase(&user_juan, 20);
+    let mut transaction_manager = TransactionManager::new().await?;
+    // transaction_manager.create_coinbase(&user_juan, 20).await?;
 
-    get_balance(&transaction_manager, &user_juan);
-    get_balance(&transaction_manager, &user_pedro);
-    get_balance(&transaction_manager, &user_yeff);
+    get_balance(&transaction_manager, &user_juan).await;
+    get_balance(&transaction_manager, &user_pedro).await;
+    get_balance(&transaction_manager, &user_yeff).await;
 
-    transaction_manager.send(&user_juan, &user_pedro, 8);
-    transaction_manager.send(&user_pedro, &user_juan, 5);
-    transaction_manager.send(&user_juan, &user_pedro, 10);
-    transaction_manager.send(&user_pedro, &user_yeff, 10);
-    transaction_manager.send(&user_yeff, &user_pedro, 7);
+    // // transaction_manager.send(&user_juan, &user_pedro, 8).await;
+    // transaction_manager.send(&user_pedro, &user_juan, 5).await;
+    // transaction_manager.send(&user_juan, &user_pedro, 10).await;
+    // transaction_manager.send(&user_pedro, &user_yeff, 10).await;
+    // transaction_manager.send(&user_yeff, &user_pedro, 7).await;
 
-    transaction_manager.print_transactions();
+    // transaction_manager.print_transactions();
 
-    get_balance(&transaction_manager, &user_juan);
-    get_balance(&transaction_manager, &user_pedro);
-    get_balance(&transaction_manager, &user_yeff);
+    // get_balance(&transaction_manager, &user_juan);
+    // get_balance(&transaction_manager, &user_pedro);
+    // get_balance(&transaction_manager, &user_yeff);
+
+    Ok(())
 }
 
-fn get_balance(transaction_manager: &TransactionManager, user: &User) {
-    let balance_juan = transaction_manager.get_balance(&user);
+async fn get_balance(transaction_manager: &TransactionManager, user: &User) {
+    let balance_juan = transaction_manager.get_balance(&user).await.unwrap();
     println!("saldo de {}: {}", user.username, balance_juan);
 }
