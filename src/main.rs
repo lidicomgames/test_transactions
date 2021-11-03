@@ -187,6 +187,10 @@ impl TransactionManager {
             }
         }
 
+        if total < value {
+            panic!("Not enough money");
+        }
+
         vouts.push(VOut {
             id: 0,
             txdir: new_txdir.to_string(),
@@ -209,6 +213,7 @@ impl TransactionManager {
         self.counter += 1;
 
         self.transactions.push(new_transaction);
+        println!("{} envio {} dolares a {}", from.username, value, to.username);
     }
 
     fn print_transactions(&self) {
@@ -248,30 +253,30 @@ fn main() {
         "p123".to_string(),
     );
 
+    let user_yeff= User::new(
+        "Yeferson".to_string(),
+        "yeff123".to_string(),
+        "y123".to_string(),
+    );
+
     let mut transaction_manager = TransactionManager::new();
     transaction_manager.create_coinbase(&user_juan, 20);
 
     get_balance(&transaction_manager, &user_juan);
     get_balance(&transaction_manager, &user_pedro);
+    get_balance(&transaction_manager, &user_yeff);
 
+    transaction_manager.send(&user_juan, &user_pedro, 8);
+    transaction_manager.send(&user_pedro, &user_juan, 5);
     transaction_manager.send(&user_juan, &user_pedro, 10);
+    transaction_manager.send(&user_pedro, &user_yeff, 10);
+    transaction_manager.send(&user_yeff, &user_pedro, 7);
+
+    transaction_manager.print_transactions();
 
     get_balance(&transaction_manager, &user_juan);
     get_balance(&transaction_manager, &user_pedro);
-
-    transaction_manager.print_transactions();
-    transaction_manager.send(&user_pedro, &user_juan, 3);
-
-    get_balance(&transaction_manager, &user_juan);
-    get_balance(&transaction_manager, &user_pedro);
-
-    transaction_manager.print_transactions();
-    transaction_manager.send(&user_juan, &user_pedro, 10);
-
-    get_balance(&transaction_manager, &user_juan);
-    get_balance(&transaction_manager, &user_pedro);
-
-    transaction_manager.print_transactions();
+    get_balance(&transaction_manager, &user_yeff);
 }
 
 fn get_balance(transaction_manager: &TransactionManager, user: &User) {
